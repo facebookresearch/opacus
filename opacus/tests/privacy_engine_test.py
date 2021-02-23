@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from opacus import PrivacyEngine
 from opacus.dp_model_inspector import IncompatibleModuleException
-from opacus.utils.module_inspection import get_layer_type, requires_grad
+from opacus.utils.module_inspection import requires_grad
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
 from torchvision.datasets import FakeData
@@ -242,7 +242,7 @@ class PrivacyEngine_test(unittest.TestCase):
 
             # collect all per-sample gradients before we take the step
             for _, layer in model.named_modules():
-                if get_layer_type(layer) == "SampleConvNet":
+                if type(layer) == SampleConvNet:
                     continue
 
                 grad_sample_aggregated[layer] = {}
@@ -253,7 +253,7 @@ class PrivacyEngine_test(unittest.TestCase):
             optimizer.step()
 
         for layer_name, layer in model.named_modules():
-            if get_layer_type(layer) == "SampleConvNet":
+            if type(layer) == SampleConvNet:
                 continue
 
             for p in layer.parameters():

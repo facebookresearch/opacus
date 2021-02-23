@@ -7,20 +7,20 @@ for a layer given two tensors: activations (module inputs) and
 backpropagations (gradient values propagated from downstream layers).
 
 Attributes:
-    _supported_layers_grad_samplers (Dict[str, Callable]): Mapping
-        from layer name to corresponding grad sampler
+    LAYER_GRAD_SAMPLERS (Dict[type, Callable]): Mapping from layer class to corresponding grad sampler
+    SUPPORTED_LAYERS (set[type]): Set of all supported layers in Opacus
 """
 
 from typing import Union
 
 import numpy as np
 import torch
+import torch.nn as nn
+from opacus.layers import ALL_DP_LAYERS
 from opacus.layers.dp_lstm import LSTMLinear
 from opacus.layers.dp_multihead_attention import SequenceBias
-from torch import nn
 from torch.functional import F
 
-from .utils.module_inspection import get_layer_type
 from .utils.tensor_utils import sum_over_all_but_batch_and_last_n, unfold3d
 
 
@@ -153,8 +153,8 @@ def _compute_norm_grad_sample(
         B: Backpropagations
         batch_dim: Batch dimension position
     """
-    layer_type = get_layer_type(layer)
-    if layer_type == "LayerNorm":
+    layer_type = type(layer)
+    if layer_type == nn.LayerNorm:
         _create_or_extend_grad_sample(
             layer.weight,
             sum_over_all_but_batch_and_last_n(
@@ -168,7 +168,7 @@ def _compute_norm_grad_sample(
             sum_over_all_but_batch_and_last_n(B, layer.bias.dim()),
             batch_dim,
         )
-    elif layer_type == "GroupNorm":
+    elif layer_type == nn.GroupNorm:
         gs = F.group_norm(A, layer.num_groups, eps=layer.eps) * B
         _create_or_extend_grad_sample(
             layer.weight, torch.einsum("ni...->ni", gs), batch_dim
@@ -177,7 +177,7 @@ def _compute_norm_grad_sample(
             _create_or_extend_grad_sample(
                 layer.bias, torch.einsum("ni...->ni", B), batch_dim
             )
-    elif layer_type in {"InstanceNorm1d", "InstanceNorm2d", "InstanceNorm3d"}:
+    elif layer_type in {nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d}:
         gs = F.instance_norm(A, eps=layer.eps) * B
         _create_or_extend_grad_sample(
             layer.weight, torch.einsum("ni...->ni", gs), batch_dim
@@ -204,14 +204,14 @@ def _compute_conv_grad_sample(
         batch_dim: Batch dimension position
     """
     n = A.shape[0]
-    layer_type = get_layer_type(layer)
+    layer_type = type(layer)
     # get A and B in shape depending on the Conv layer
-    if layer_type == "Conv2d":
+    if layer_type == nn.Conv2d:
         A = torch.nn.functional.unfold(
             A, layer.kernel_size, padding=layer.padding, stride=layer.stride
         )
         B = B.reshape(n, -1, A.shape[-1])
-    elif layer_type == "Conv1d":
+    elif layer_type == nn.Conv1d:
         # unfold doesn't work for 3D tensors; so force it to be 4D
         A = A.unsqueeze(-2)  # add the H dimension
         # set arguments to tuples with appropriate second element
@@ -222,7 +222,7 @@ def _compute_conv_grad_sample(
             stride=(1, layer.stride[0]),
         )
         B = B.reshape(n, -1, A.shape[-1])
-    elif layer_type == "Conv3d":
+    elif layer_type == nn.Conv3d:
         A = unfold3d(A, layer.kernel_size, layer.padding, layer.stride)
         B = B.reshape(n, -1, A.shape[-1])
 
@@ -276,17 +276,19 @@ def _compute_embedding_grad_sample(
     _create_or_extend_grad_sample(layer.weight, grad_sample, batch_dim)
 
 
-_supported_layers_grad_samplers = {
-    "Embedding": _compute_embedding_grad_sample,
-    "Linear": _compute_linear_grad_sample,
-    "LSTMLinear": _compute_accumulate_linear_grad_sample,
-    "Conv3d": _compute_conv_grad_sample,
-    "Conv2d": _compute_conv_grad_sample,
-    "Conv1d": _compute_conv_grad_sample,
-    "LayerNorm": _compute_norm_grad_sample,
-    "GroupNorm": _compute_norm_grad_sample,
-    "InstanceNorm1d": _compute_norm_grad_sample,
-    "InstanceNorm2d": _compute_norm_grad_sample,
-    "InstanceNorm3d": _compute_norm_grad_sample,
-    "SequenceBias": _compute_sequence_bias_grad_sample,
+LAYER_GRAD_SAMPLERS = {
+    nn.Embedding: _compute_embedding_grad_sample,
+    nn.Linear: _compute_linear_grad_sample,
+    LSTMLinear: _compute_accumulate_linear_grad_sample,
+    nn.Conv3d: _compute_conv_grad_sample,
+    nn.Conv2d: _compute_conv_grad_sample,
+    nn.Conv1d: _compute_conv_grad_sample,
+    nn.LayerNorm: _compute_norm_grad_sample,
+    nn.GroupNorm: _compute_norm_grad_sample,
+    nn.InstanceNorm1d: _compute_norm_grad_sample,
+    nn.InstanceNorm2d: _compute_norm_grad_sample,
+    nn.InstanceNorm3d: _compute_norm_grad_sample,
+    SequenceBias: _compute_sequence_bias_grad_sample,
 }  # Supported layer class types
+
+SUPPORTED_LAYERS = set(LAYER_GRAD_SAMPLERS.keys()) | ALL_DP_LAYERS

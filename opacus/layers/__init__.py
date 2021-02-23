@@ -6,4 +6,12 @@ from .dp_multihead_attention import DPMultiheadAttention, SequenceBias
 from .param_rename import ParamRenamedModule
 
 
-__all__ = ["DPLSTM", "DPMultiheadAttention", "ParamRenamedModule", "SequenceBias"]
+ALL_DP_LAYERS = {DPLSTM, DPMultiheadAttention}
+
+__all__ = [
+    "ALL_DP_LAYERS",
+    "DPLSTM",
+    "DPMultiheadAttention",
+    "ParamRenamedModule",
+    "SequenceBias",
+]

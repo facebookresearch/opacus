@@ -20,8 +20,7 @@ import torch
 import torch.nn as nn
 from opacus.layers.dp_lstm import LSTMLinear
 
-from .supported_layers_grad_samplers import _supported_layers_grad_samplers
-from .utils.module_inspection import get_layer_type, requires_grad
+from .supported_layers_grad_samplers import LAYER_GRAD_SAMPLERS, SUPPORTED_LAYERS
 
 
 # work-around for https://github.com/pytorch/pytorch/issues/25723
@@ -55,7 +54,7 @@ def add_hooks(model: nn.Module, loss_reduction: str = "mean", batch_first: bool 
 
     handles = []
     for layer in model.modules():
-        if get_layer_type(layer) in _supported_layers_grad_samplers.keys():
+        if type(layer) in SUPPORTED_LAYERS:
             handles.append(layer.register_forward_hook(_capture_activations))
 
             handles.append(
@@ -112,10 +111,7 @@ def is_supported(layer: nn.Module) -> bool:
     Returns:
         Whether the ``layer`` is supported by this library.
     """
-    return get_layer_type(layer) in list(_supported_layers_grad_samplers.keys()) + [
-        "DPLSTM",
-        "DPMultiheadAttention",
-    ]
+    return type(layer) in SUPPORTED_LAYERS
 
 
 def _capture_activations(
@@ -129,17 +125,12 @@ def _capture_activations(
         inputs: Inputs to the ``layer``.
         outputs: Outputs of the ``layer``.
     """
-    layer_type = get_layer_type(layer)
-    if (
-        not requires_grad(layer)
-        or layer_type not in _supported_layers_grad_samplers.keys()
-        or not layer.training
-    ):
+    if not requires_grad(layer) or is_supported(layer) or not layer.training:
         return
 
     if _hooks_disabled:
         return
-    if get_layer_type(layer) not in _supported_layers_grad_samplers.keys():
+    if not is_supported(layer):
         raise ValueError("Hook installed on unsupported layer")
 
     if not hasattr(layer, "activations"):
@@ -198,12 +189,7 @@ def _compute_grad_sample(
             first dimension else set to False (``batch_first=False`` implies
             that the batch is always in the second dimension).
     """
-    layer_type = get_layer_type(layer)
-    if (
-        not requires_grad(layer)
-        or layer_type not in _supported_layers_grad_samplers.keys()
-        or not layer.training
-    ):
+    if not requires_grad(layer) or not is_supported(layer) or not layer.training:
         return
 
     if not hasattr(layer, "activations"):
@@ -235,7 +221,21 @@ def _compute_grad_sample(
         A = A.permute([batch_dim] + [x for x in range(A.dim()) if x != batch_dim])
         B = B.permute([batch_dim] + [x for x in range(B.dim()) if x != batch_dim])
     # compute grad sample for  individual layers
-    compute_layer_grad_sample = _supported_layers_grad_samplers.get(
-        get_layer_type(layer)
-    )
+    compute_layer_grad_sample = LAYER_GRAD_SAMPLERS[type(layer)]
     compute_layer_grad_sample(layer, A, B)
+
+
+def requires_grad(module: nn.Module, recurse: bool = False) -> bool:
+    """
+    Checks if any parameters in a specified module require gradients.
+
+    Args:
+        module: PyTorch module whose parameters are examined
+        recurse: Flag specifying if the gradient requirement check should
+            be applied recursively to sub-modules of the specified module
+
+    Returns:
+        Flag indicate if any parameters require gradients
+    """
+    requires_grad = any(p.requires_grad for p in module.parameters(recurse))
+    return requires_grad
