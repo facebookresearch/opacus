@@ -8,9 +8,10 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
-from opacus.grad_sample import GradSampleModule
 from scipy.stats import planck
 from torch import nn
+
+from opacus.grad_sample import GradSampleModule
 
 from . import privacy_analysis
 from .dp_model_inspector import DPModelInspector
@@ -20,7 +21,6 @@ from .layers.dp_ddp import (
 )
 from .per_sample_gradient_clip import PerSampleGradientClipper
 from .utils import clipping
-
 
 DEFAULT_ALPHAS = [1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64))
 
@@ -145,7 +145,9 @@ class PrivacyEngine:
         self.sample_rate = sample_rate
         self._set_sample_rate()
 
-        if isinstance(module, DifferentiallyPrivateDistributedDataParallel):
+        if isinstance(
+            module, DifferentiallyPrivateDistributedDataParallel
+        ) or isinstance(module, torch.nn.parallel.DistributedDataParallel):
             rank = torch.distributed.get_rank()
             n_replicas = torch.distributed.get_world_size()
             self.sample_rate *= n_replicas
@@ -154,6 +156,18 @@ class PrivacyEngine:
             n_replicas = 1
 
         self.module = GradSampleModule(module)
+
+        if isinstance(module, torch.nn.parallel.DistributedDataParallel):
+            # Check that the clipper will be per-layer (once initialized)
+            if isinstance(self.max_grad_norm, list) or (
+                self.misc_settings.get("experimental", False)
+                and self.misc_settings.get("clip_per_layer", False)
+            ):
+                self.module.add_ddp_hook(engine=self)
+            else:
+                raise ValueError(
+                    "The Opacus DDP hook only supports per-layer clipping."
+                )
 
         if poisson:
             # TODO: Check directly if sampler is UniformSampler when sampler gets passed to the Engine (in the future)
@@ -327,9 +341,11 @@ class PrivacyEngine:
             self.original_zero_grad()
 
         def dp_step(self, closure=None, is_empty=False):
+
             self.privacy_engine.step(is_empty)
             if isinstance(
-                self.privacy_engine.module, DifferentiallyPrivateDistributedDataParallel
+                self.privacy_engine.module._module,
+                DifferentiallyPrivateDistributedDataParallel,
             ):
                 average_gradients(self.privacy_engine.module)
             self.original_step(closure)
@@ -348,14 +364,27 @@ class PrivacyEngine:
 
         optimizer.dp_step = types.MethodType(dp_step, optimizer)
         optimizer.original_step = optimizer.step
-        optimizer.step = types.MethodType(
-            poisson_dp_step if self.poisson else dp_step, optimizer
-        )
+
+        # When the DDP hook is enabled, we don't need to monkey-patch the optimizer step
+        # because the clipping and noising are performed by the hook at the end of the backward pass
+        if (not hasattr(self.module, "ddp_hook_activated")) or (
+            self.module.ddp_hook_activated == False
+        ):
+            optimizer.step = types.MethodType(
+                poisson_dp_step if self.poisson else dp_step, optimizer
+            )
+            # TODO: check the accounting
 
         optimizer.original_zero_grad = optimizer.zero_grad
         optimizer.zero_grad = types.MethodType(dp_zero_grad, optimizer)
 
         def virtual_step(self):
+
+            # TODO: add support for virtual step in the DDP hook too
+            if (hasattr(self.module, "ddp_hook_activated")) and (
+                self.module.ddp_hook_activated
+            ):
+                raise NotImplementedError("DDP hook does not support virtual step yet.")
             self.privacy_engine.virtual_step()
 
         optimizer.virtual_step = types.MethodType(virtual_step, optimizer)
@@ -475,6 +504,7 @@ class PrivacyEngine:
             if self.loss_reduction == "mean":
                 noise /= batch_size
 
+            # TODO: Why do we need to generate noise on every GPU if only rank0 will use it?
             if self.rank == 0:
                 # Noise only gets added on first worker
                 # This is easy to reason about for loss_reduction=sum

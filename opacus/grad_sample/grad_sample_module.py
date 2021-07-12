@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from opacus.layers.dp_lstm import DPLSTM, LSTMLinear
 from opacus.utils.module_inspection import requires_grad
+from opacus.utils.tensor_utils import calc_sample_norms
 
 
 class UnsupportedModuleError(ValueError):
@@ -103,11 +104,34 @@ class GradSampleModule(nn.Module):
                 )
         self.enable_hooks()
 
+    def add_ddp_hook(
+        self, engine, loss_reduction: str = "mean", batch_first: bool = True
+    ) -> None:
+        """
+        Special function to enable DDP support on top of a GradSampleModule
+        """
+
+        self.ddp_hook_activated = True
+
+        # We store the number of layers for the per-layer clipping
+        self.n_params = 0
+
+        # Each layer has its own callback to clip/noise
+        for p in self.parameters():
+            if p.requires_grad:
+                self.n_params += 1
+                p.register_hook(partial(self.ddp_backward_callback, engine, p))
+
     def remove_hooks(self) -> None:
         """
         Removes hooks added by ``add_hooks()``
         """
         self.disable_hooks()
+
+        if self.ddp_hook_activated:
+            pass
+            # TODO: remove DDP hooks
+
         if not hasattr(self, "autograd_grad_sample_hooks"):
             raise ValueError("Asked to remove hooks, but no hooks found")
         else:
@@ -262,6 +286,94 @@ class GradSampleModule(nn.Module):
     def is_supported(cls, module: nn.Module) -> bool:
         """Check if this module is supported"""
         return type(module) in cls.GRAD_SAMPLERS or type(module) is DPLSTM
+
+    def ddp_backward_callback(self, engine, p, grad):
+        """
+        This hook operates like PrivacyEngine.step(), but on a single layer:
+        1. clip_and_accumulate
+        2. get the clip_values with clipper.pre_step()
+        3. add the noise
+        """
+
+        # Get the norm of the gradient for each sample for this layer
+        all_norms = calc_sample_norms(
+            named_params=((None, p.grad_sample),),
+            flat=False,
+        )
+
+        # Get the constant clipping factor for a single layer
+        clipping_factor = engine.clipper.norm_clipper.calc_clipping_factors(all_norms)
+        assert len(clipping_factor) == 1
+        clip_factor = clipping_factor[0]
+        batch_size = p.grad_sample.shape[0]
+
+        # Do the clipping
+        summed_grad = engine.clipper._weighted_sum(clip_factor, p.grad_sample)
+
+        # accumulate the summed gradient for this mini-batch
+        if hasattr(p, "summed_grad"):
+            p.summed_grad += summed_grad
+        else:
+            p.summed_grad = summed_grad
+
+        del p.grad_sample
+
+        # Average (or sum) across the batch
+        # TODO: add support for Poisson batch sampling
+        res = engine.clipper._scale_summed_grad(p.summed_grad, batch_size)
+
+        del p.summed_grad
+
+        # NOTE: `self.clipper.pre_step()` returns a tensor with n=n_params clip_values
+        # where each clip_value is the L2 norm of `threshs`:
+        #   `max_norm = threshs.new_full((n,), threshs.norm(2))`
+        # With per layer clipping, `threshs` is a tensor with n flat_values
+        assert len(engine.clipper.norm_clipper.thresholds) == 1
+        clipping_thresh = engine.clipper.norm_clipper.thresholds[0]
+        clip_value = (self.n_params ** 0.5) * clipping_thresh
+        # if engine.rank == 0:
+        #     print(
+        #         f"max_grad_norm: {engine.max_grad_norm} \nclipping_tresh: {clipping_thresh}\nclip_value: {clip_value}"
+        #     )
+
+        noise = _generate_noise_ddp(engine, clip_value, res)
+        if engine.loss_reduction == "mean":
+            noise /= batch_size
+
+        # Only one GPU adds noise
+        if engine.rank == 0:
+            res += noise
+
+        return res
+
+
+def _generate_noise_ddp(
+    engine, max_grad_norm: float, reference: nn.parameter.Parameter
+) -> torch.Tensor:
+    r"""
+    Generates a tensor of Gaussian noise of the same shape as ``reference``.
+
+    The generated tensor has zero mean and standard deviation
+    sigma = ``noise_multiplier x max_grad_norm ``
+
+    Args:
+        max_grad_norm : The maximum norm of the per-sample gradients.
+        reference : The reference, based on which the dimention of the
+            noise tensor will be determined
+
+    Returns:
+        the generated noise with noise zero and standard
+        deviation of ``noise_multiplier x max_grad_norm ``
+    """
+    if engine.noise_multiplier > 0 and max_grad_norm > 0:
+        return torch.normal(
+            0,
+            engine.noise_multiplier * max_grad_norm,
+            reference.shape,
+            device=engine.device,
+            generator=engine.random_number_generator,
+        )
+    return torch.zeros(reference.shape, device=engine.device)
 
 
 def _get_batch_size(
